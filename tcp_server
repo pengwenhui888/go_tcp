@@ -1,0 +1,270 @@
+package main
+
+import (
+    "fmt"
+    "net"
+    "time"
+    "os"
+    "encoding/json"
+    "bufio"
+   // "io/ioutil"
+   // "hash/crc32"
+    "io"
+    "github.com/garyburd/redigo/redis"
+)
+//数据包的类型
+const (
+    HEART_BEAT_PACKET = 0x00
+    REPORT_PACKET = 0x01
+    PASSPORT_PACKET = 0x02
+)
+var (
+    server = "127.0.0.1:8080"
+)
+var (
+	connMap = make(map[string]net.Conn)
+	)
+
+
+//这里是包的结构体，其实是可以不需要的
+type Packet struct {
+    PacketType      byte
+    PacketContent     []byte
+}
+//心跳包，这里用了json来序列化，也可以用github上的gogo/protobuf包
+//具体见(https://github.com/gogo/protobuf)
+type HeartPacket struct {
+    Version     string`json:"version"`
+    Timestamp   int64`json:"timestamp"`
+}
+//正式上传的数据包
+type ReportPacket struct {
+    Content   string`json:"content"`
+    Rand         int`json:"rand"`
+    Timestamp   int64`json:"timestamp"`
+}
+
+//登录包
+type PassportPacket struct {
+    Username   string`json:"username"`
+    Password         int`json:"password"`
+    Timestamp   int64`json:"timestamp"`
+}
+
+//与服务器相关的资源都放在这里面
+type TcpServer struct {
+    listener       *net.TCPListener
+    hawkServer  *net.TCPAddr
+}
+
+func main() {
+    //类似于初始化套接字，绑定端口
+    hawkServer, err := net.ResolveTCPAddr("tcp", server)
+    checkErr(err)
+    //侦听
+     listen, err := net.ListenTCP("tcp", hawkServer)
+    checkErr(err)
+    //记得关闭
+    defer listen.Close()
+    tcpServer := &TcpServer{
+        listener:listen,
+        hawkServer:hawkServer,
+    }
+    fmt.Println("start server successful......")
+    go PublishMessage()
+    //开始接收请求
+    for {
+        conn, err := tcpServer.listener.Accept()
+        fmt.Println("accept tcp client %s",conn.RemoteAddr().String())
+        checkErr(err)
+        // 每次建立一个连接就放到单独的协程内做处理
+        go Handle(conn)
+    }
+
+}
+
+//处理函数，这是一个状态机
+//根据数据包来做解析
+//数据包的格式为|0xFF|0xFF|len(高)|len(低)|Data|CRC高16位|0xFF|0xFE
+//其中len为data的长度，实际长度为len(高)*256+len(低)
+//CRC为32位CRC，取了最高16位共2Bytes
+//0xFF|0xFF和0xFF|0xFE类似于前导码
+func Handle(conn net.Conn) {
+    messnager := make(chan byte)
+    // close connection before exit
+    defer conn.Close()
+    // 状态机状态
+    state := 0x00
+    // 数据包长度
+    length := uint16(0)
+    // crc校验和
+   // crc16 := uint16(0)
+    var recvBuffer []byte
+    // 游标
+    cursor := uint16(0)
+    bufferReader := bufio.NewReader(conn)
+    //状态机处理数据
+    for {
+        recvByte,err := bufferReader.ReadByte()
+        if err != nil {
+            //这里因为做了心跳，所以就没有加deadline时间，如果客户端断开连接
+            //这里ReadByte方法返回一个io.EOF的错误，具体可考虑文档
+            if err == io.EOF {
+                fmt.Printf("client %s is close!\n",conn.RemoteAddr().String())
+            }
+            //在这里直接退出goroutine，关闭由defer操作完成
+            return
+        }
+        //进入状态机，根据不同的状态来处理
+        switch state {
+        case 0x00:
+            if recvByte == 0xFF {
+                state = 0x01
+                //初始化状态机
+                recvBuffer = nil
+                length = 0
+               //crc16 = 0
+            }else{
+                state = 0x00
+            }
+            break
+        case 0x01:
+            length += uint16(recvByte)
+            // 一次申请缓存，初始化游标，准备读数据
+            recvBuffer = make([]byte,length)
+            cursor = 0
+            state = 0x02
+            break
+        case 0x02:
+            //不断地在这个状态下读数据，直到满足长度为止
+            recvBuffer[cursor] = recvByte
+            cursor++
+            if(cursor == length){
+                state = 0x03
+            }
+            break
+        case 0x03:
+            if recvByte == 0xFF {
+                state = 0x04
+            }else{
+                state = 0x00
+            }
+        case 0x04:  
+            if recvByte == 0xFE {
+                //执行数据包校验
+                //if (crc32.ChecksumIEEE(recvBuffer) >> 16) & 0xFFFF == uint32(crc16) {
+                    var packet Packet
+                    //把拿到的数据反序列化出来
+                    json.Unmarshal(recvBuffer,&packet)
+                    //新开协程处理数据
+                    go processRecvData(&packet,conn)
+                    //start heartbeating
+                    go HeartBeating(conn,messnager,5)
+                    //check if get message from client
+                    go GravelChannel(recvBuffer,messnager)
+
+                //}else{
+                //    fmt.Println("丢弃数据!")
+                //}
+            }
+            //状态机归位,接收下一个包
+            state = 0x00
+        }
+    }
+}
+
+//在这里处理收到的包，就和一般的逻辑一样了，根据类型进行不同的处理，因人而异
+//我这里处理了心跳和一个上报数据包
+//服务器往客户端的数据包很简单地以\n换行结束了，偷了一个懒:)，正常情况下也可根据自己的协议来封装好
+//然后在客户端写一个状态来处理
+func processRecvData(packet *Packet,conn net.Conn)  {
+    switch packet.PacketType {
+    case HEART_BEAT_PACKET:
+        var beatPacket HeartPacket
+        json.Unmarshal(packet.PacketContent,&beatPacket)
+        fmt.Printf("recieve heat beat from [%s] ,data is [%v]\n",conn.RemoteAddr().String(),beatPacket)
+        conn.Write([]byte("heartBeat\n"))
+        return
+    case REPORT_PACKET:
+        var reportPacket ReportPacket
+        json.Unmarshal(packet.PacketContent,&reportPacket)
+        fmt.Printf("recieve report data json from [%s] ,data is [%v]\n",conn.RemoteAddr().String(),reportPacket.Content)
+        conn.Write([]byte("Report data has recive\n"))
+        return
+    case PASSPORT_PACKET:
+        var passportPacket PassportPacket
+        json.Unmarshal(packet.PacketContent,&passportPacket)
+        connMap[passportPacket.Username] = conn
+        fmt.Printf("recieve loing data json from [%s] ,data is [%v]\n",conn.RemoteAddr().String(),passportPacket.Username)
+        conn.Write([]byte("Login success\n"))
+     
+        //return
+    }
+}
+
+//消息推送采用redis的订阅模式
+func PublishMessage(){
+    //conn.Write([]byte("PublishMessage success 1\n"))
+	c, err := redis.Dial("tcp", "127.0.0.1:6379")
+    if err != nil {
+        fmt.Println("Connect to redis error", err)
+        return
+    }
+    defer c.Close()
+
+    _, err = c.Do("lpush", "message", "redis")
+    if err != nil {
+        fmt.Println("redis set failed:", err)
+    }
+
+    _, err = c.Do("lpush", "message", "mongodb")
+    if err != nil {
+        fmt.Println("redis set failed:", err)
+    }
+    _, err = c.Do("lpush", "message", "mysql")
+    if err != nil {
+        fmt.Println("redis set failed:", err)
+    }
+    for{
+        values, _ := redis.String(c.Do("lpop", "message"))
+        if(values != ""){
+            c,ok  := connMap["TONY"]
+            if(ok){
+             
+                c.Write([]byte("PublishMessage success 2-------"+values))
+            }
+        
+        	fmt.Println("redis values is-------"+values)
+        }
+        
+    }
+}
+
+func HeartBeating(conn net.Conn, readerChannel chan byte,timeout int) {
+    select {
+    case _ = <-readerChannel:
+        fmt.Println( "get message, keeping heartbeating...",conn.RemoteAddr().String())
+        conn.SetDeadline(time.Now().Add(time.Duration(timeout) * time.Second))
+        break
+    case <-time.After(time.Second*5):
+        fmt.Println("It's really weird to get Nothing!!!")
+        conn.Close()
+    }
+
+}
+
+func GravelChannel(n []byte,mess chan byte){
+    for _ , v := range n{
+        mess <- v
+    }
+    close(mess)
+}
+
+
+//处理错误，根据实际情况选择这样处理，还是在函数调之后不同的地方不同处理
+func checkErr(err error) {
+    if err != nil {
+        fmt.Println(err)
+        os.Exit(-1)
+    }
+}
